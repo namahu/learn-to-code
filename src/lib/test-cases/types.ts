@@ -28,6 +28,7 @@ export interface TestCase {
 export interface TestCaseSpec {
   functionName: string;
   callKind?: TestCallKind;
+  argTypes?: ("str" | "String")[];
   cases: TestCase[];
 }
 
