@@ -59,7 +59,7 @@ export const authOptions: NextAuthOptions = {
       }
       return true;
     },
-    async jwt({ token, user, account, trigger }: any) {
+    async jwt({ token, user, account }: any) {
       if (user) {
         token.id = user.id;
         token.picture = user.image;
@@ -67,12 +67,30 @@ export const authOptions: NextAuthOptions = {
       if (account) {
         token.provider = account.provider;
       }
+      if (token.id) {
+        const dbUser = await prisma.user.findUnique({
+          where: { id: token.id },
+          select: { hasPaid: true },
+        });
+        token.hasPaid = dbUser?.hasPaid || false;
+      }
       return token;
     },
     async session({ session, token }: any) {
       if (session.user) {
         session.user.id = token.id as string;
         session.user.image = token.picture as string;
+
+        // Always read from DB — JWT hasPaid can be stale after webhook/grandfather updates.
+        if (token.id) {
+          const dbUser = await prisma.user.findUnique({
+            where: { id: token.id as string },
+            select: { hasPaid: true },
+          });
+          session.user.hasPaid = !!dbUser?.hasPaid;
+        } else {
+          session.user.hasPaid = false;
+        }
       }
       return session;
     }

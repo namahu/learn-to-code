@@ -4,10 +4,12 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useSession, signOut } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { Challenge } from "@/types/challenge";
+import { getGradingMode, isChallengeCorrect } from "@/lib/grading";
 import { Sidebar } from "./Sidebar";
 import { ChallengePane } from "./ChallengePane";
 import { CodeEditor } from "./CodeEditor";
 import { OutputPanel } from "./OutputPanel";
+import { TestResultPanel } from "./TestResultPanel";
 import { AuthPromptModal } from "./AuthPromptModal";
 import { formatRustTestResult } from "@/lib/format-test-output";
 import { ThemeToggle } from "./ThemeToggle";
@@ -58,15 +60,17 @@ export function AppShell() {
   const [showAuthPrompt, setShowAuthPrompt] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [activeTab, setActiveTab] = useState<"challenge" | "editor" | "output">("challenge");
+  const [runVerified, setRunVerified] = useState<boolean | null>(null);
+  const [executionMode, setExecutionMode] = useState<"run" | "test" | null>(null);
+  const [runningAction, setRunningAction] = useState<"run" | "test" | null>(null);
+  const [testResult, setTestResult] = useState<TestRunResult | null>(null);
 
   useEffect(() => {
     const handleResize = () => {
-      const mobile = window.innerWidth < 768;
-      setIsMobile(mobile);
+      setIsMobile(window.innerWidth < 768);
     };
     handleResize();
 
-    // Close sidebar by default on mobile on first load
     if (window.innerWidth < 768) {
       setShowSidebar(false);
     }
@@ -104,7 +108,7 @@ export function AppShell() {
       }
     };
     loadChallenges();
-  }, []);
+  }, [status]);
 
   // Resizable output panel states & callbacks
   const containerRef = useRef<HTMLDivElement>(null);
@@ -280,105 +284,180 @@ export function AppShell() {
       const saved = savedCode[challenge.id] || challenge.starterCode;
       setCode(saved);
       setOutput("");
+      setRunVerified(null);
+      setExecutionMode(null);
+      setTestResult(null);
       // Reset the restore flag so saved code is restored when switching challenges
       hasRestoredCodeRef.current = false;
 
-      // On mobile, auto-close sidebar and switch to challenge description
       if (window.innerWidth < 768) {
         setShowSidebar(false);
         setActiveTab("challenge");
       }
     },
-    [selectedChallenge, code, savedCode, status, setShowSidebar, setActiveTab]
+    [selectedChallenge, code, savedCode, status]
   );
 
-  const markChallengeComplete = useCallback(() => {
-    if (!selectedChallenge) return;
-    const updated = new Set(completedChallengesRef.current);
-    updated.add(selectedChallenge.id);
-    setCompletedChallenges(updated);
-    if (status === "authenticated") {
-      saveProgressToServer(selectedChallenge.id, true, code);
-    }
-  }, [selectedChallenge, status, code]);
-
-  const runChallengeTests = useCallback(async (): Promise<{
-    success: boolean;
-    stdout: string;
-    stderr: string;
-  }> => {
-    const res = await fetch("/api/test", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, test: selectedChallenge?.test }),
-    });
-    return res.json();
-  }, [code, selectedChallenge?.test]);
-
-  const handleRunCode = useCallback(async () => {
-    if (!selectedChallenge) return;
-
-    // For guests: show the friendly sign-up prompt instead of running.
-    // We always show on Run (even if they dismissed the typing prompt).
+  const requireAuth = useCallback(() => {
     if (status === "unauthenticated") {
       setShowAuthPrompt(true);
-      return;
+      return false;
     }
+    return true;
+  }, [status]);
 
-    // On mobile, auto-switch to output tab
+  const handleRunCode = useCallback(async () => {
+    if (!selectedChallenge || !requireAuth()) return;
+
     if (window.innerWidth < 768) {
       setActiveTab("output");
     }
 
+    const gradingMode = getGradingMode(selectedChallenge);
+    const usesTests = gradingMode === "tests";
+
     setIsRunning(true);
+    setRunningAction("run");
+    setExecutionMode("run");
+    setRunVerified(null);
+    setTestResult(null);
     setOutput("Compiling...");
 
     try {
       const res = await fetch("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, challengeId: selectedChallenge.id }),
+        body: JSON.stringify({
+          code,
+          challengeId: selectedChallenge.id,
+          mode: "run",
+        }),
       });
-      const data = await res.json();
+      const data = await parseApiJson<{
+        success: boolean;
+        stdout?: string;
+        stderr?: string;
+        locked?: boolean;
+      }>(res);
+
+      if (res.status === 402 || data.locked) {
+        setOutput("This challenge is temporarily unavailable.");
+        setIsRunning(false);
+        setRunningAction(null);
+        return;
+      }
 
       if (data.success) {
-        const stdout = (data.stdout || "").trim();
-        const expected = selectedChallenge.expectedOutput?.trim();
-        let outputText = data.stdout || "(no output)";
-        let passed = false;
+        const stdout = data.stdout || "(no output)";
+        setOutput(stdout);
 
-        if (selectedChallenge.test) {
-          const testData = await runChallengeTests();
-          const formatted = formatRustTestResult(
-            testData.success,
-            testData.stdout || "",
-            testData.stderr || ""
+        // Print-based challenges: Run grades the solution
+        if (!usesTests) {
+          const passed = isChallengeCorrect(
+            "output",
+            { success: data.success, stdout },
+            selectedChallenge.expectedOutput
           );
-          if (formatted.passed) {
-            passed = true;
-            outputText += `\n\n${formatted.display}`;
-          } else {
-            outputText += `\n\n${formatted.display}`;
+          setRunVerified(passed);
+
+          if (passed) {
+            const updated = new Set(completedChallengesRef.current);
+            updated.add(selectedChallenge.id);
+            setCompletedChallenges(updated);
+
+            if (status === "authenticated") {
+              saveProgressToServer(selectedChallenge.id, true, code);
+            }
           }
         }
-
-        if (!passed && expected && stdout === expected) {
-          passed = true;
-        }
-
-        setOutput(outputText);
-        if (passed) {
-          markChallengeComplete();
-        }
       } else {
+        setRunVerified(false);
         setOutput(data.stderr || "Compilation error");
       }
     } catch (err) {
+      setRunVerified(false);
       setOutput(`Error: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       setIsRunning(false);
+      setRunningAction(null);
     }
-  }, [code, selectedChallenge, status, markChallengeComplete, runChallengeTests, setActiveTab]);
+  }, [code, selectedChallenge, status, requireAuth]);
+
+  const handleSubmitTests = useCallback(async () => {
+    if (!selectedChallenge || !requireAuth()) return;
+
+    if (window.innerWidth < 768) {
+      setActiveTab("output");
+    }
+
+    setIsRunning(true);
+    setRunningAction("test");
+    setExecutionMode("test");
+    setRunVerified(null);
+    setTestResult(null);
+    setOutput("Running tests...");
+
+    try {
+      const res = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          code,
+          challengeId: selectedChallenge.id,
+          mode: "test",
+        }),
+      });
+      const data = await parseApiJson<{
+        success: boolean;
+        stdout?: string;
+        stderr?: string;
+        locked?: boolean;
+        testResult?: TestRunResult;
+      }>(res);
+
+      if (res.status === 402 || data.locked) {
+        setOutput("This challenge is temporarily unavailable.");
+        setIsRunning(false);
+        setRunningAction(null);
+        return;
+      }
+
+      if (data.testResult) {
+        setTestResult(data.testResult);
+        setRunVerified(data.testResult.accepted);
+
+        if (data.testResult.accepted) {
+          const updated = new Set(completedChallengesRef.current);
+          updated.add(selectedChallenge.id);
+          setCompletedChallenges(updated);
+
+          if (status === "authenticated") {
+            saveProgressToServer(selectedChallenge.id, true, code);
+          }
+        }
+      } else if (data.success) {
+        setOutput(data.stdout || "All tests passed!");
+        setRunVerified(true);
+
+        const updated = new Set(completedChallengesRef.current);
+        updated.add(selectedChallenge.id);
+        setCompletedChallenges(updated);
+
+        if (status === "authenticated") {
+          saveProgressToServer(selectedChallenge.id, true, code);
+        }
+      } else {
+        setRunVerified(false);
+        setOutput(data.stderr || data.stdout || "Tests failed");
+      }
+    } catch (err) {
+      setRunVerified(false);
+      setOutput(`Error: ${err instanceof Error ? err.message : "Unknown error"}`);
+    } finally {
+      setIsRunning(false);
+      setRunningAction(null);
+    }
+  }, [code, selectedChallenge, status, requireAuth]);
 
   const handleResetCode = useCallback(() => {
     if (!selectedChallenge) return;
@@ -386,6 +465,9 @@ export function AppShell() {
     const starter = selectedChallenge.starterCode;
     setCode(starter);
     setOutput("");
+    setRunVerified(null);
+    setExecutionMode(null);
+    setTestResult(null);
 
     // Remove from local cache
     setSavedCode(prev => {
@@ -399,49 +481,6 @@ export function AppShell() {
       void saveProgressToServer(selectedChallenge.id, false, starter);
     }
   }, [selectedChallenge, status]);
-
-  const handleTestCode = useCallback(async () => {
-    if (!selectedChallenge) return;
-
-    if (status === "unauthenticated") {
-      setShowAuthPrompt(true);
-      return;
-    }
-
-    if (!selectedChallenge.test) {
-      setOutput("No tests defined for this challenge.");
-      return;
-    }
-
-    // On mobile, auto-switch to output tab
-    if (window.innerWidth < 768) {
-      setActiveTab("output");
-    }
-
-    setIsRunning(true);
-    setOutput("Running tests...");
-
-    try {
-      const data = await runChallengeTests();
-
-      const formatted = formatRustTestResult(
-        data.success,
-        data.stdout || "",
-        data.stderr || ""
-      );
-
-      if (formatted.passed) {
-        setOutput(formatted.display);
-        markChallengeComplete();
-      } else {
-        setOutput(formatted.display);
-      }
-    } catch (err) {
-      setOutput(`Error: ${err instanceof Error ? err.message : "Unknown error"}`);
-    } finally {
-      setIsRunning(false);
-    }
-  }, [selectedChallenge, status, runChallengeTests, markChallengeComplete, setActiveTab]);
 
   // Wrapped code change handler: guests can type and see the editor fully.
   // We gently prompt them once the first time they start writing code.
@@ -581,7 +620,6 @@ export function AppShell() {
 
       {/* Main content */}
       <div className="flex flex-1 overflow-hidden relative">
-        {/* Mobile Sidebar Overlay/Backdrop */}
         {showSidebar && isMobile && (
           <div
             className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 md:hidden animate-fade-in"
@@ -589,7 +627,6 @@ export function AppShell() {
           />
         )}
 
-        {/* Sidebar */}
         <Sidebar
           challenges={challenges}
           selectedId={selectedChallenge.id}
@@ -603,10 +640,7 @@ export function AppShell() {
           `}
         />
 
-        {/* Center: challenge + editor + output */}
         <div className="flex-1 flex flex-col min-w-0 bg-background relative">
-          
-          {/* Mobile Tab Bar */}
           <div className="flex md:hidden border-b border-border bg-surface shrink-0 z-10">
             <button
               onClick={() => setActiveTab("challenge")}
@@ -637,25 +671,27 @@ export function AppShell() {
               }`}
             >
               Output
-              {output && !isRunning && activeTab !== "output" && (
-                <span className={`absolute top-3 right-4.5 w-1.5 h-1.5 rounded-full ${
-                  output.trim() === selectedChallenge.expectedOutput?.trim() || output.includes("✓ ") || output.includes("\n\n✓ ")
-                    ? "bg-success animate-pulse"
-                    : "bg-error animate-pulse"
-                }`} />
+              {(output || testResult) && !isRunning && activeTab !== "output" && (
+                <span
+                  className={`absolute top-3 right-4.5 w-1.5 h-1.5 rounded-full ${
+                    runVerified === true || testResult?.accepted
+                      ? "bg-success animate-pulse"
+                      : "bg-error animate-pulse"
+                  }`}
+                />
               )}
             </button>
           </div>
 
-          {/* Challenge Description (Scrollable container on mobile, block layout on desktop) */}
-          <div className={`
+          <div
+            className={`
             md:block shrink-0
             ${isMobile && activeTab === "challenge" ? "flex-1 overflow-y-auto block" : "hidden"}
-          `}>
+          `}
+          >
             <ChallengePane challenge={selectedChallenge} />
           </div>
 
-          {/* Editor + Output Area */}
           <div
             ref={containerRef}
             className={`
@@ -664,48 +700,57 @@ export function AppShell() {
               ${isDragging ? "select-none" : ""}
             `}
           >
-            {/* Code Editor */}
-            <div className={`
+            <div
+              className={`
               flex-1 flex flex-col min-h-0
               ${isMobile && activeTab !== "editor" ? "hidden" : "flex"}
-            `}>
+            `}
+            >
               <CodeEditor
                 code={code}
                 onChange={handleCodeChange}
                 onRun={handleRunCode}
+                onSubmitTests={handleSubmitTests}
                 onReset={handleResetCode}
-                onTest={handleTestCode}
                 isRunning={isRunning}
-                hasTest={!!selectedChallenge.test}
+                runningAction={runningAction}
+                hasTestCases={!!selectedChallenge.hasTestCases}
               />
             </div>
 
-            {/* Resizable Divider (Desktop only) */}
             <div
-              className={`hidden md:flex h-2 cursor-ns-resize bg-border/50 hover:bg-accent/40 active:bg-accent transition-colors shrink-0 items-center justify-center relative group z-10 select-none touch-none`}
+              className="hidden md:flex h-2 cursor-ns-resize bg-border/50 hover:bg-accent/40 active:bg-accent transition-colors shrink-0 items-center justify-center relative group z-10 select-none touch-none"
               onPointerDown={startDragging}
             >
               <div className="w-8 h-0.5 rounded-full bg-muted/20 group-hover:bg-accent/60 group-active:bg-accent transition-colors" />
             </div>
 
-            {/* Output Panel */}
-            <div className={`
+            <div
+              className={`
               ${isMobile && activeTab !== "output" ? "hidden" : "flex flex-col"}
               ${isMobile ? "flex-1 min-h-0 h-full" : "shrink-0"}
-            `}>
-              <OutputPanel
-                output={output}
-                expectedOutput={selectedChallenge.expectedOutput || undefined}
-                hasTest={!!selectedChallenge.test}
-                isRunning={isRunning}
-                height={isMobile ? undefined : outputHeight}
-                className={isMobile ? "border-t-0" : ""}
-              />
+            `}
+            >
+              {executionMode === "test" && testResult && !isRunning ? (
+                <TestResultPanel
+                  result={testResult}
+                  height={isMobile ? undefined : outputHeight}
+                />
+              ) : (
+                <OutputPanel
+                  output={output}
+                  expectedOutput={selectedChallenge.expectedOutput || undefined}
+                  isRunning={isRunning}
+                  height={isMobile ? undefined : outputHeight}
+                  executionMode={executionMode}
+                  challengeGradingMode={getGradingMode(selectedChallenge)}
+                  verified={runVerified}
+                  className={isMobile ? "border-t-0 flex-1" : ""}
+                />
+              )}
             </div>
           </div>
         </div>
-
-
       </div>
 
       <AuthPromptModal
