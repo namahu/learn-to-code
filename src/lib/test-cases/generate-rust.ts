@@ -36,6 +36,16 @@ export function toRustLiteral(value: TestCaseValue): string {
   return String(value);
 }
 
+export function toRustArg(
+  value: TestCaseValue,
+  argType?: "str" | "String"
+): string {
+  if (argType === "String" && typeof value === "string") {
+    return `&String::from(${toRustLiteral(value)})`;
+  }
+  return toRustLiteral(value);
+}
+
 export function toDisplayExpected(expected: TestCaseExpected): string {
   if (isStructExpected(expected)) {
     const fields = Object.entries(expected.struct)
@@ -52,9 +62,12 @@ export function resolveFunctionName(spec: TestCaseSpec, c: TestCase): string {
 
 export function formatFunctionCall(
   functionName: string,
-  args: TestCaseValue[]
+  args: TestCaseValue[],
+  argTypes?: ("str" | "String")[]
 ): string {
-  return `${functionName}(${args.map(toRustLiteral).join(", ")})`;
+  return `${functionName}(${args
+    .map((v, i) => toRustArg(v, argTypes?.[i]))
+    .join(", ")})`;
 }
 
 export function formatCaseInput(spec: TestCaseSpec, c: TestCase): string {
@@ -69,7 +82,7 @@ export function formatCaseInput(spec: TestCaseSpec, c: TestCase): string {
     return `${fn}(&mut ${varName}) after "${c.initial}"`;
   }
 
-  return formatFunctionCall(fn, c.args ?? []);
+  return formatFunctionCall(fn, c.args ?? [], spec.argTypes);
 }
 
 function generateCaseAssert(spec: TestCaseSpec, c: TestCase): string {
@@ -90,7 +103,7 @@ function generateCaseAssert(spec: TestCaseSpec, c: TestCase): string {
   }
 
   if (spec.callKind === "associated" && isStructExpected(c.expected)) {
-    const call = formatFunctionCall(fn, c.args ?? []);
+    const call = formatFunctionCall(fn, c.args ?? [], spec.argTypes);
     const resultVar = `result_${c.id}`;
     const fieldAsserts = Object.entries(c.expected.struct)
       .map(([field, value]) => `assert_eq!(${resultVar}.${field}, ${toRustLiteral(value)});`)
@@ -99,7 +112,7 @@ function generateCaseAssert(spec: TestCaseSpec, c: TestCase): string {
         ${fieldAsserts}`;
   }
 
-  return `assert_eq!(${formatFunctionCall(fn, c.args ?? [])}, ${toDisplayExpected(c.expected)});`;
+  return `assert_eq!(${formatFunctionCall(fn, c.args ?? [], spec.argTypes)}, ${toDisplayExpected(c.expected)});`;
 }
 
 export function generateRustTests(spec: TestCaseSpec): string {

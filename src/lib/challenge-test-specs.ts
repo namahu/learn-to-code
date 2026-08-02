@@ -76,6 +76,7 @@ export const CHALLENGE_TEST_SPECS: Record<number, TestCaseSpec> = {
 
   32: {
     functionName: "calculate_length",
+    argTypes: ["String"],
     cases: [
       { id: 1, label: "Case 1", args: ["hello"], expected: 5 },
       { id: 2, label: "Case 2", args: [""], expected: 0 },
